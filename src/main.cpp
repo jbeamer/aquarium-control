@@ -6,14 +6,10 @@
 #include <Adafruit_TSC2007.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-
 #include "wifi_ota.h"
 
-// Include better fonts
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSans18pt7b.h>
-#include <Fonts/FreeSans24pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
@@ -21,411 +17,546 @@
 // ---------------------------------------------------------------------------
 // Pin definitions
 //
-// TFT FeatherWing (fixed, do not change):
-//   TFT_CS = 15, TFT_DC = 33, SPI = MOSI/MISO/SCK, TSC2007 touch over I2C.
-//
-// Relays: active-HIGH, wired left-to-right in the power box as Lights / Heater / Filter.
-// Current sensors: all on ADC1 so they remain readable after WiFi starts.
+// TFT FeatherWing (fixed): TFT_CS=15, TFT_DC=33, TSC2007 touch over I2C.
+// Relays: active-HIGH. Filter is normally-closed (LOW=on, HIGH=off).
+// Current sensors: ADC1 pins only (readable while WiFi is active).
 // ---------------------------------------------------------------------------
 #define TFT_CS            15
 #define TFT_DC            33
 #define TEMP_SENSOR_PIN   14
 
-#define LIGHTS_RELAY_PIN  13   // active HIGH, normally open (also onboard red LED)
-#define HEATER_RELAY_PIN  12   // active HIGH, normally open (STRAP PIN - must be LOW at boot)
-#define FILTER_RELAY_PIN  27   // active HIGH, normally closed
+#define LIGHTS_RELAY_PIN  13   // active HIGH (also onboard red LED)
+#define HEATER_RELAY_PIN  12   // active HIGH (GPIO 12 strap pin: must be LOW at boot)
+#define FILTER_RELAY_PIN  27   // normally-closed: LOW=on, HIGH=off
 
-#define LIGHTS_SENSE_PIN  34   // A2 - ADC1, input-only
-#define HEATER_SENSE_PIN  39   // A3 - ADC1, input-only
-#define FILTER_SENSE_PIN  36   // A4 - ADC1, input-only
+#define LIGHTS_SENSE_PIN  34   // ADC1 ch6, input-only
+#define HEATER_SENSE_PIN  39   // ADC1 ch3, input-only
+#define FILTER_SENSE_PIN  36   // ADC1 ch0, input-only
 
-// Aquarium-inspired color palette
-#define COLOR_DEEP_OCEAN    0x0451
-#define COLOR_WATER_BLUE    0x1E9F
-#define COLOR_LIGHT_AQUA    0x5F3F
-#define COLOR_CORAL_PINK    0xFB6C
-#define COLOR_WARM_AMBER    0xFD20
-#define COLOR_COOL_WHITE    0xFFFF
-#define COLOR_SOFT_GRAY     0x8410
-#define COLOR_SEAFOAM       0x87F3
-#define COLOR_REEF_PURPLE   0x8017
-#define COLOR_WARNING_RED   0xF800
+// ---------------------------------------------------------------------------
+// Colors — flat dark scheme
+// ---------------------------------------------------------------------------
+#define C_BG       0x0841   // very dark blue-gray
+#define C_PANEL    0x18C3   // dark panel (left/temp side)
+#define C_HEADER   0x1082   // header and sensor-row bar
+#define C_DIVIDER  0x4A69   // panel border lines
+#define C_WHITE    0xFFFF
+#define C_GRAY     0x8410
+#define C_DIM      0x39E7   // inactive / off state
+#define C_GREEN    0x07E0
+#define C_AMBER    0xFD20
+#define C_RED      0xF800
+#define C_YELLOW   0xFFE0
 
-// Display and touch
-Adafruit_HX8357 tft = Adafruit_HX8357(TFT_CS, TFT_DC);
+// ---------------------------------------------------------------------------
+// Layout constants (all in pixels, absolute screen coords)
+// Screen: 480 wide x 320 tall, setRotation(1)
+// ---------------------------------------------------------------------------
+#define SCREEN_W   480
+#define SCREEN_H   320
+#define HEADER_H    40
+#define SENSOR_H    40
+#define SPLIT_X    240          // x boundary between temp and lights panels
+#define MAIN_Y     HEADER_H     // 40
+#define MAIN_H     (SCREEN_H - HEADER_H - SENSOR_H)  // 240
+#define SENSOR_Y   (SCREEN_H - SENSOR_H)             // 280
+
+// Maintenance button in header
+#define MAINT_BTN_X  283
+#define MAINT_BTN_Y    5
+#define MAINT_BTN_W  190
+#define MAINT_BTN_H   30
+
+// ---------------------------------------------------------------------------
+// Thermostat config
+// ---------------------------------------------------------------------------
+#define SET_POINT           78.0f   // °F; will move to web config in phase 5
+#define HEATER_HYST          0.3f   // heater on below (SET_POINT - HYST)
+#define MAINT_EXIT_MIN_TEMP 74.0f   // minimum temp to allow exiting maintenance mode
+
+// ---------------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------------
+#define TEMP_INTERVAL     2000UL
+#define SENSOR_INTERVAL   2000UL
+#define SLEEP_MS      (5UL * 60 * 1000)
+#define OVERRIDE_MS   (5UL * 60 * 1000)
+#define CONFIRM_MS    2000UL
+
+// ---------------------------------------------------------------------------
+// Hardware objects
+// ---------------------------------------------------------------------------
+Adafruit_HX8357 tft(TFT_CS, TFT_DC);
 Adafruit_TSC2007 touch;
-
-// Temperature sensor
 OneWire oneWire(TEMP_SENSOR_PIN);
 DallasTemperature tempSensor(&oneWire);
 
-// State variables
-float currentTemp = 74.0;
-float setPoint = 78.0;
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+float currentTemp = 74.0f;
 unsigned long lastTempRead = 0;
-const unsigned long TEMP_READ_INTERVAL = 2000;
 
-// Relay states
 bool heaterOn = false;
 bool lightsOn = false;
 bool filterOn = true;
-bool lightsManualOverride = false;
 
-// Lights schedule
-int lightsOnHour = 8;
-int lightsOffHour = 20;
+// Lights 5-minute manual override
+bool lightsOverride = false;
+unsigned long lightsOverrideStart = 0;
+unsigned long lastCountdownDraw = 0;
 
-// Screen management
-enum Screen { SCREEN_THERMOSTAT, SCREEN_LIGHTS };
-Screen currentScreen = SCREEN_THERMOSTAT;
+// Maintenance / water-change mode
+enum MaintState : uint8_t { MAINT_NORMAL, MAINT_CONFIRM, MAINT_ACTIVE };
+MaintState maintState = MAINT_NORMAL;
+unsigned long maintConfirmAt = 0;
 
-// Button definitions
-struct Button {
-  int x, y, w, h;
+// Display sleep
+bool displayAsleep = false;
+unsigned long lastActivity = 0;
+
+// Current-sensor raw ADC readings
+int senseLights = 0, senseHeater = 0, senseFilter = 0;
+unsigned long lastSensorRead = 0;
+
+// ---------------------------------------------------------------------------
+// Relay helpers — idempotent, log on change
+// ---------------------------------------------------------------------------
+void setHeater(bool on) {
+  if (heaterOn == on) return;
+  heaterOn = on;
+  digitalWrite(HEATER_RELAY_PIN, on ? HIGH : LOW);
+  Serial.printf("[Heater] %s\n", on ? "ON" : "OFF");
+}
+
+void setLights(bool on) {
+  if (lightsOn == on) return;
+  lightsOn = on;
+  digitalWrite(LIGHTS_RELAY_PIN, on ? HIGH : LOW);
+  Serial.printf("[Lights] %s\n", on ? "ON" : "OFF");
+}
+
+void setFilter(bool on) {
+  if (filterOn == on) return;
+  filterOn = on;
+  // Normally-closed relay: LOW = energized-off wait — actually:
+  //   LOW  → relay not energized → NC contacts closed → filter ON
+  //   HIGH → relay energized     → NC contacts open   → filter OFF
+  digitalWrite(FILTER_RELAY_PIN, on ? LOW : HIGH);
+  Serial.printf("[Filter] %s\n", on ? "ON" : "OFF");
+}
+
+// ---------------------------------------------------------------------------
+// Draw: header bar
+// ---------------------------------------------------------------------------
+void drawHeader() {
+  tft.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
+
+  tft.setFont(&FreeSansBold12pt7b);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(12, 28);
+  tft.print("AQUARIUM");
+
+  // WiFi status dot
+  tft.fillCircle(252, 20, 7, WifiOta::isConnected() ? C_GREEN : C_RED);
+
+  // Maintenance button — label and color reflect current state
   const char* label;
-  uint16_t color;
-  uint16_t bgColor;
-};
-
-Button btnTempUp = {360, 80, 100, 70, "+", COLOR_COOL_WHITE, COLOR_SEAFOAM};
-Button btnTempDown = {360, 170, 100, 70, "-", COLOR_COOL_WHITE, COLOR_CORAL_PINK};
-Button btnToLights = {20, 250, 200, 35, "LIGHTS", COLOR_COOL_WHITE, COLOR_WATER_BLUE};
-
-Button btnLightsToggle = {140, 100, 200, 80, "", COLOR_COOL_WHITE, COLOR_WARM_AMBER};
-Button btnOnTimeUp = {360, 70, 90, 55, "+", COLOR_COOL_WHITE, COLOR_LIGHT_AQUA};
-Button btnOnTimeDown = {360, 135, 90, 55, "-", COLOR_COOL_WHITE, COLOR_LIGHT_AQUA};
-Button btnOffTimeUp = {360, 210, 90, 55, "+", COLOR_COOL_WHITE, COLOR_REEF_PURPLE};
-Button btnOffTimeDown = {360, 275, 90, 55, "-", COLOR_COOL_WHITE, COLOR_REEF_PURPLE};
-Button btnToThermostat = {20, 250, 200, 35, "TEMP", COLOR_COOL_WHITE, COLOR_WATER_BLUE};
-
-void controlHeater() {
-  bool shouldHeat = (currentTemp < setPoint - 0.3);
-  
-  if (shouldHeat != heaterOn) {
-    heaterOn = shouldHeat;
-    digitalWrite(HEATER_RELAY_PIN, heaterOn);
-    Serial.printf("Heater turned %s\n", heaterOn ? "ON" : "OFF");
-  }
-}
-
-void updateLights() {
-  if (lightsManualOverride) {
-    return;
-  }
-  // Schedule logic would go here with RTC
-}
-
-void drawButton(Button &btn, bool pressed = false) {
-  uint16_t fillColor = pressed ? btn.color : btn.bgColor;
-  uint16_t textColor = pressed ? btn.bgColor : btn.color;
-  
-  // Draw rounded rectangle button
-  tft.fillRoundRect(btn.x, btn.y, btn.w, btn.h, 12, fillColor);
-  tft.drawRoundRect(btn.x, btn.y, btn.w, btn.h, 12, btn.color);
-  
-  // Draw text centered
-  tft.setFont(&FreeSansBold18pt7b);
-  tft.setTextColor(textColor);
-  
-  int16_t x1, y1;
-  uint16_t tw, th;
-  tft.getTextBounds(btn.label, 0, 0, &x1, &y1, &tw, &th);
-  
-  // FreeSans fonts need Y adjustment for vertical centering
-  int textX = btn.x + (btn.w - tw) / 2;
-  int textY = btn.y + (btn.h + th) / 2 - 3;
-  
-  tft.setCursor(textX, textY);
-  tft.print(btn.label);
-}
-
-void drawThermostatScreen() {
-  // Gradient-like background (simulated with horizontal bands)
-  for (int y = 0; y < 320; y += 4) {
-    uint16_t color = 0x0020 + (y / 20);  // Subtle gradient
-    tft.drawFastHLine(0, y, 480, color);
-    tft.drawFastHLine(0, y+1, 480, color);
-    tft.drawFastHLine(0, y+2, 480, color);
-    tft.drawFastHLine(0, y+3, 480, color);
-  }
-  
-  // Title bar
-  tft.fillRect(0, 0, 480, 50, COLOR_WATER_BLUE);
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COLOR_COOL_WHITE);
-  tft.setCursor(20, 32);
-  tft.print("AQUARIUM CONTROLLER");
-  
-  // Temperature display - large and beautiful
-  tft.setFont(&FreeSansBold24pt7b);
-  tft.setTextColor(COLOR_COOL_WHITE);
-  
-  char tempStr[10];
-  sprintf(tempStr, "%.1f°", currentTemp);
-  
-  int16_t x1, y1;
-  uint16_t tw, th;
-  tft.getTextBounds(tempStr, 0, 0, &x1, &y1, &tw, &th);
-  tft.setCursor(40, 130);
-  tft.print(tempStr);
-  
-  // "F" in smaller font
-  tft.setFont(&FreeSans18pt7b);
-  tft.setCursor(40 + tw + 5, 130);
-  tft.print("F");
-  
-  // Set point
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COLOR_LIGHT_AQUA);
-  tft.setCursor(40, 175);
-  tft.printf("Target: %.1f°F", setPoint);
-  
-  // Status indicator with icon-like display
-  tft.fillRoundRect(30, 190, 300, 45, 10, COLOR_DEEP_OCEAN);
-  tft.setFont(&FreeSans12pt7b);
-  
-  if (heaterOn) {
-    tft.setTextColor(COLOR_WARM_AMBER);
-    tft.setCursor(45, 220);
-    tft.print("HEATING");
-  } else if (currentTemp > setPoint + 0.5) {
-    tft.setTextColor(COLOR_WATER_BLUE);
-    tft.setCursor(45, 220);
-    tft.print("STANDBY");
+  uint16_t btnBg;
+  if (maintState == MAINT_CONFIRM) {
+    label = "CONFIRM?"; btnBg = C_AMBER;
+  } else if (maintState == MAINT_ACTIVE) {
+    label = "RESUME NORMAL"; btnBg = C_RED;
   } else {
-    tft.setTextColor(COLOR_SEAFOAM);
-    tft.setCursor(45, 220);
-    tft.print("AT TARGET");
+    label = "MAINTENANCE"; btnBg = C_DIM;
   }
-  
-  // Lights mini-status
+
+  tft.fillRoundRect(MAINT_BTN_X, MAINT_BTN_Y, MAINT_BTN_W, MAINT_BTN_H, 6, btnBg);
   tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(lightsOn ? COLOR_WARM_AMBER : COLOR_SOFT_GRAY);
-  tft.setCursor(250, 270);
-  tft.printf("Lights: %s", lightsOn ? "ON" : "OFF");
-  
-  // Draw buttons
-  drawButton(btnTempUp);
-  drawButton(btnTempDown);
-  drawButton(btnToLights);
+  tft.setTextColor(C_WHITE);
+  int16_t bx, by; uint16_t bw, bh;
+  tft.getTextBounds(label, 0, 0, &bx, &by, &bw, &bh);
+  tft.setCursor(MAINT_BTN_X + (MAINT_BTN_W - (int)bw) / 2 - bx,
+                MAINT_BTN_Y + (MAINT_BTN_H + (int)bh) / 2);
+  tft.print(label);
 }
 
-void drawLightsScreen() {
-  // Similar gradient background
-  for (int y = 0; y < 320; y += 4) {
-    uint16_t color = 0x0020 + (y / 20);
-    tft.drawFastHLine(0, y, 480, color);
-    tft.drawFastHLine(0, y+1, 480, color);
-    tft.drawFastHLine(0, y+2, 480, color);
-    tft.drawFastHLine(0, y+3, 480, color);
+// ---------------------------------------------------------------------------
+// Draw: temperature panel (left half of main area)
+// ---------------------------------------------------------------------------
+void drawTempPanel() {
+  tft.fillRect(0, MAIN_Y, SPLIT_X, MAIN_H, C_PANEL);
+
+  int16_t x1, y1; uint16_t tw, th;
+
+  // -- Large temperature readout --
+  char tbuf[12];
+  snprintf(tbuf, sizeof(tbuf), "%.1f\xB0""F", currentTemp);
+  tft.setFont(&FreeSansBold24pt7b);
+  tft.setTextColor(C_WHITE);
+  tft.getTextBounds(tbuf, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((SPLIT_X - (int)tw) / 2 - x1, MAIN_Y + 60);
+  tft.print(tbuf);
+
+  // -- Delta from target --
+  float delta = currentTemp - SET_POINT;
+  char dbuf[28];
+  uint16_t dcol;
+  if (fabsf(delta) <= 0.5f) {
+    snprintf(dbuf, sizeof(dbuf), "At target");
+    dcol = C_GREEN;
+  } else if (delta < 0) {
+    snprintf(dbuf, sizeof(dbuf), "%.1f\xB0 below target", -delta);
+    dcol = C_AMBER;
+  } else {
+    snprintf(dbuf, sizeof(dbuf), "+%.1f\xB0 above target", delta);
+    dcol = C_RED;
   }
-  
-  // Title bar
-  tft.fillRect(0, 0, 480, 50, COLOR_WATER_BLUE);
+  tft.setFont(&FreeSans12pt7b);
+  tft.setTextColor(dcol);
+  tft.getTextBounds(dbuf, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((SPLIT_X - (int)tw) / 2 - x1, MAIN_Y + 93);
+  tft.print(dbuf);
+
+  // -- Heater on/off badge --
+  const char* hlabel = heaterOn ? "HEATER  ON" : "HEATER  OFF";
+  uint16_t hbg = heaterOn ? C_AMBER : C_DIM;
+  uint16_t htx = heaterOn ? C_BG    : C_GRAY;
+  tft.fillRoundRect(12, MAIN_Y + 104, SPLIT_X - 24, 44, 10, hbg);
   tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COLOR_COOL_WHITE);
-  tft.setCursor(20, 32);
-  tft.print("LIGHTING CONTROL");
-  
-  // Status display
-  tft.fillRoundRect(30, 60, 280, 60, 15, lightsOn ? COLOR_WARM_AMBER : COLOR_DEEP_OCEAN);
-  tft.setFont(&FreeSansBold18pt7b);
-  tft.setTextColor(lightsOn ? COLOR_DEEP_OCEAN : COLOR_SOFT_GRAY);
-  tft.setCursor(95, 100);
-  tft.print(lightsOn ? "LIGHTS ON" : "LIGHTS OFF");
-  
-  // Mode indicator
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(COLOR_LIGHT_AQUA);
-  tft.setCursor(30, 140);
-  tft.printf("Mode: %s", lightsManualOverride ? "MANUAL" : "AUTO");
-  
-  // Schedule section
-  tft.fillRoundRect(20, 155, 330, 115, 10, COLOR_DEEP_OCEAN);
-  
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COLOR_LIGHT_AQUA);
-  tft.setCursor(35, 185);
-  tft.print("ON TIME");
-  
-  tft.setFont(&FreeSans18pt7b);
-  tft.setTextColor(COLOR_COOL_WHITE);
-  tft.setCursor(190, 185);
-  tft.printf("%02d:00", lightsOnHour);
-  
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COLOR_REEF_PURPLE);
-  tft.setCursor(35, 245);
-  tft.print("OFF TIME");
-  
-  tft.setFont(&FreeSans18pt7b);
-  tft.setTextColor(COLOR_COOL_WHITE);
-  tft.setCursor(190, 245);
-  tft.printf("%02d:00", lightsOffHour);
-  
-  // Update toggle button label
-  btnLightsToggle.label = lightsOn ? "TURN OFF" : "TURN ON";
-  btnLightsToggle.bgColor = lightsOn ? COLOR_CORAL_PINK : COLOR_SEAFOAM;
-  
-  // Draw buttons
-  drawButton(btnLightsToggle);
-  drawButton(btnOnTimeUp);
-  drawButton(btnOnTimeDown);
-  drawButton(btnOffTimeUp);
-  drawButton(btnOffTimeDown);
-  drawButton(btnToThermostat);
-}
+  tft.setTextColor(htx);
+  tft.getTextBounds(hlabel, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor(12 + (SPLIT_X - 24 - (int)tw) / 2 - x1,
+                MAIN_Y + 104 + (44 + (int)th) / 2);
+  tft.print(hlabel);
 
-bool isButtonPressed(Button &btn, int touchX, int touchY) {
-  return (touchX >= btn.x && touchX <= (btn.x + btn.w) &&
-          touchY >= btn.y && touchY <= (btn.y + btn.h));
-}
-
-void handleThermostatTouch(int screenX, int screenY) {
-  if (isButtonPressed(btnTempUp, screenX, screenY)) {
-    setPoint += 0.5;
-    drawButton(btnTempUp, true);
-    delay(100);
-    drawThermostatScreen();
-  } else if (isButtonPressed(btnTempDown, screenX, screenY)) {
-    setPoint -= 0.5;
-    drawButton(btnTempDown, true);
-    delay(100);
-    drawThermostatScreen();
-  } else if (isButtonPressed(btnToLights, screenX, screenY)) {
-    currentScreen = SCREEN_LIGHTS;
-    drawLightsScreen();
-  }
-}
-
-void handleLightsTouch(int screenX, int screenY) {
-  if (isButtonPressed(btnLightsToggle, screenX, screenY)) {
-    lightsOn = !lightsOn;
-    lightsManualOverride = true;
-    digitalWrite(LIGHTS_RELAY_PIN, lightsOn);
-    drawButton(btnLightsToggle, true);
-    delay(100);
-    drawLightsScreen();
-  } else if (isButtonPressed(btnOnTimeUp, screenX, screenY)) {
-    lightsOnHour = (lightsOnHour + 1) % 24;
-    drawLightsScreen();
-  } else if (isButtonPressed(btnOnTimeDown, screenX, screenY)) {
-    lightsOnHour = (lightsOnHour - 1 + 24) % 24;
-    drawLightsScreen();
-  } else if (isButtonPressed(btnOffTimeUp, screenX, screenY)) {
-    lightsOffHour = (lightsOffHour + 1) % 24;
-    drawLightsScreen();
-  } else if (isButtonPressed(btnOffTimeDown, screenX, screenY)) {
-    lightsOffHour = (lightsOffHour - 1 + 24) % 24;
-    drawLightsScreen();
-  } else if (isButtonPressed(btnToThermostat, screenX, screenY)) {
-    currentScreen = SCREEN_THERMOSTAT;
-    drawThermostatScreen();
-  }
-}
-
-void handleTouch() {
-  uint16_t x, y, z1, z2;
-  
-  if (!touch.read_touch(&x, &y, &z1, &z2)) {
-    return;
-  }
-  
-  if (z1 < 100) {
-    return;
-  }
-  
-  int screenX = map(y, 4095, 0, 0, 480);
-  int screenY = map(x, 0, 4095, 0, 320);
-  
-  if (currentScreen == SCREEN_THERMOSTAT) {
-    handleThermostatTouch(screenX, screenY);
-  } else if (currentScreen == SCREEN_LIGHTS) {
-    handleLightsTouch(screenX, screenY);
-  }
-  
-  delay(200);
-}
-
-void readTemperature() {
-  unsigned long now = millis();
-  if (now - lastTempRead < TEMP_READ_INTERVAL) {
-    return;
-  }
-  
-  lastTempRead = now;
-  tempSensor.requestTemperatures();
-  float newTemp = tempSensor.getTempFByIndex(0);
-  
-  if (newTemp > 32 && newTemp < 120) {
-    if (abs(newTemp - currentTemp) > 0.1) {
-      currentTemp = newTemp;
-      if (currentScreen == SCREEN_THERMOSTAT) {
-        drawThermostatScreen();
-      }
+  // -- Maintenance overlay (lower portion, only when active) --
+  if (maintState == MAINT_ACTIVE) {
+    tft.fillRoundRect(12, MAIN_Y + 158, SPLIT_X - 24, 58, 8, C_RED);
+    tft.setFont(&FreeSans9pt7b);
+    tft.setTextColor(C_WHITE);
+    tft.setCursor(22, MAIN_Y + 178);
+    tft.print("MAINTENANCE MODE");
+    tft.setCursor(22, MAIN_Y + 200);
+    if (currentTemp < MAINT_EXIT_MIN_TEMP) {
+      char wb[28];
+      snprintf(wb, sizeof(wb), "Temp %.1f\xB0""F < 74\xB0""F", currentTemp);
+      tft.print(wb);
+    } else {
+      tft.print("Tap RESUME NORMAL");
     }
   }
 }
 
+// ---------------------------------------------------------------------------
+// Draw: lights panel (right half of main area)
+// ---------------------------------------------------------------------------
+void drawLightsPanel() {
+  tft.fillRect(SPLIT_X, MAIN_Y, SCREEN_W - SPLIT_X, MAIN_H, C_BG);
+  tft.drawFastVLine(SPLIT_X, MAIN_Y, MAIN_H, C_DIVIDER);
+
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(C_GRAY);
+  tft.setCursor(SPLIT_X + 15, MAIN_Y + 22);
+  tft.print("LIGHTS");
+
+  tft.setFont(&FreeSansBold18pt7b);
+  tft.setTextColor(lightsOn ? C_YELLOW : C_DIM);
+  tft.setCursor(SPLIT_X + 15, MAIN_Y + 75);
+  tft.print(lightsOn ? "ON" : "OFF");
+
+  if (!lightsOn) {
+    tft.setFont(&FreeSans9pt7b);
+    tft.setTextColor(C_GRAY);
+    tft.setCursor(SPLIT_X + 15, MAIN_Y + 108);
+    tft.print("Tap to enable 5 min");
+  } else if (lightsOverride) {
+    unsigned long elapsed = millis() - lightsOverrideStart;
+    if (elapsed > OVERRIDE_MS) elapsed = OVERRIDE_MS;
+    int remaining = (int)((OVERRIDE_MS - elapsed) / 1000);
+    char cbuf[8];
+    snprintf(cbuf, sizeof(cbuf), "%d:%02d", remaining / 60, remaining % 60);
+
+    tft.setFont(&FreeSans12pt7b);
+    tft.setTextColor(C_AMBER);
+    tft.setCursor(SPLIT_X + 15, MAIN_Y + 112);
+    tft.print(cbuf);
+
+    tft.setFont(&FreeSans9pt7b);
+    tft.setTextColor(C_GRAY);
+    tft.setCursor(SPLIT_X + 15, MAIN_Y + 135);
+    tft.print("remaining");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Draw: current-sensor row (bottom bar)
+// ---------------------------------------------------------------------------
+void drawSensorRow() {
+  tft.fillRect(0, SENSOR_Y, SCREEN_W, SENSOR_H, C_HEADER);
+  tft.drawFastHLine(0, SENSOR_Y, SCREEN_W, C_DIVIDER);
+
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(C_GRAY);
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "LT: %4d", senseLights);
+  tft.setCursor(8, SENSOR_Y + 28);
+  tft.print(buf);
+
+  snprintf(buf, sizeof(buf), "HT: %4d", senseHeater);
+  tft.setCursor(168, SENSOR_Y + 28);
+  tft.print(buf);
+
+  snprintf(buf, sizeof(buf), "FT: %4d", senseFilter);
+  tft.setCursor(330, SENSOR_Y + 28);
+  tft.print(buf);
+}
+
+// Full screen redraw
+void drawStatusScreen() {
+  tft.fillScreen(C_BG);
+  drawHeader();
+  drawTempPanel();
+  drawLightsPanel();
+  drawSensorRow();
+}
+
+// ---------------------------------------------------------------------------
+// Sensor reads
+// ---------------------------------------------------------------------------
+void readTemperature() {
+  if (millis() - lastTempRead < TEMP_INTERVAL) return;
+  lastTempRead = millis();
+
+  tempSensor.requestTemperatures();
+  float t = tempSensor.getTempFByIndex(0);
+  if (t > 32 && t < 120 && fabsf(t - currentTemp) > 0.05f) {
+    currentTemp = t;
+    if (!displayAsleep) drawTempPanel();
+  }
+}
+
+void readCurrentSensors() {
+  if (millis() - lastSensorRead < SENSOR_INTERVAL) return;
+  lastSensorRead = millis();
+
+  senseLights = analogRead(LIGHTS_SENSE_PIN);
+  senseHeater = analogRead(HEATER_SENSE_PIN);
+  senseFilter = analogRead(FILTER_SENSE_PIN);
+  if (!displayAsleep) drawSensorRow();
+}
+
+// ---------------------------------------------------------------------------
+// Control logic
+// ---------------------------------------------------------------------------
+void controlHeater() {
+  if (maintState == MAINT_ACTIVE) { setHeater(false); return; }
+  setHeater(currentTemp < SET_POINT - HEATER_HYST);
+}
+
+void controlFilter() {
+  if (maintState == MAINT_ACTIVE) { setFilter(false); return; }
+  setFilter(true);
+}
+
+// ---------------------------------------------------------------------------
+// Lights override timer
+// ---------------------------------------------------------------------------
+void updateLightsOverride() {
+  if (!lightsOverride) return;
+
+  if (millis() - lightsOverrideStart >= OVERRIDE_MS) {
+    lightsOverride = false;
+    setLights(false);
+    if (!displayAsleep) drawLightsPanel();
+    return;
+  }
+
+  // Redraw countdown once per second
+  if (millis() - lastCountdownDraw >= 1000) {
+    lastCountdownDraw = millis();
+    if (!displayAsleep) drawLightsPanel();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance confirm timeout
+// ---------------------------------------------------------------------------
+void checkMaintConfirm() {
+  if (maintState != MAINT_CONFIRM) return;
+  if (millis() - maintConfirmAt >= CONFIRM_MS) {
+    maintState = MAINT_NORMAL;
+    if (!displayAsleep) drawHeader();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Display sleep
+// ---------------------------------------------------------------------------
+void wakeDisplay() {
+  displayAsleep = false;
+  lastActivity = millis();
+  drawStatusScreen();
+}
+
+void checkDisplaySleep() {
+  if (!displayAsleep && millis() - lastActivity > SLEEP_MS) {
+    displayAsleep = true;
+    tft.fillScreen(0x0000);
+    Serial.println("[Display] Sleep");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WiFi status — redraw header dot on change
+// ---------------------------------------------------------------------------
+void checkWifiStatus() {
+  static bool lastWifi = false;
+  bool now = WifiOta::isConnected();
+  if (now != lastWifi) {
+    lastWifi = now;
+    if (!displayAsleep) drawHeader();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Touch handling
+// ---------------------------------------------------------------------------
+static inline bool hit(int tx, int ty, int x, int y, int w, int h) {
+  return tx >= x && tx < x + w && ty >= y && ty < y + h;
+}
+
+void handleTouch() {
+  uint16_t rx, ry, z1, z2;
+  if (!touch.read_touch(&rx, &ry, &z1, &z2)) return;
+  if (z1 < 100) return;
+
+  // Coordinate mapping for setRotation(1).
+  // Print raw values to serial to verify corner mapping on hardware.
+  int sx = map(ry, 0, 4095, 0, SCREEN_W);
+  int sy = map(rx, 4095, 0, 0, SCREEN_H);
+  Serial.printf("[Touch] raw=(%u,%u) z1=%u  screen=(%d,%d)\n", rx, ry, z1, sx, sy);
+
+  if (displayAsleep) {
+    wakeDisplay();
+    delay(200);
+    return;
+  }
+  lastActivity = millis();
+
+  // -- Maintenance button (header) --
+  if (hit(sx, sy, MAINT_BTN_X, MAINT_BTN_Y, MAINT_BTN_W, MAINT_BTN_H)) {
+    if (maintState == MAINT_NORMAL) {
+      maintState = MAINT_CONFIRM;
+      maintConfirmAt = millis();
+      drawHeader();
+
+    } else if (maintState == MAINT_CONFIRM) {
+      maintState = MAINT_ACTIVE;
+      Serial.println("[Maint] Entering maintenance mode");
+      setFilter(false);
+      setHeater(false);
+      setLights(true);
+      drawStatusScreen();
+
+    } else if (maintState == MAINT_ACTIVE) {
+      if (currentTemp >= MAINT_EXIT_MIN_TEMP) {
+        maintState = MAINT_NORMAL;
+        Serial.println("[Maint] Exiting maintenance mode");
+        drawStatusScreen();
+      } else {
+        // Temp too low — flash warning in the overlay area, then restore
+        tft.fillRoundRect(12, MAIN_Y + 158, SPLIT_X - 24, 58, 8, C_RED);
+        tft.setFont(&FreeSans9pt7b);
+        tft.setTextColor(C_WHITE);
+        tft.setCursor(22, MAIN_Y + 178);
+        tft.print("Can't resume yet:");
+        tft.setCursor(22, MAIN_Y + 200);
+        char wb[28];
+        snprintf(wb, sizeof(wb), "Temp %.1f\xB0""F < 74\xB0""F", currentTemp);
+        tft.print(wb);
+        delay(2500);
+        drawTempPanel();
+      }
+    }
+    delay(200);
+    return;
+  }
+
+  // -- Lights panel tap (right half of main area) --
+  if (maintState != MAINT_ACTIVE &&
+      hit(sx, sy, SPLIT_X, MAIN_Y, SCREEN_W - SPLIT_X, MAIN_H)) {
+    if (!lightsOn) {
+      lightsOverride = true;
+      lightsOverrideStart = millis();
+      lastCountdownDraw = millis();
+      setLights(true);
+      drawLightsPanel();
+    }
+    // If lights are already on, tap does nothing
+    delay(200);
+    return;
+  }
+
+  delay(200);
+}
+
+// ---------------------------------------------------------------------------
+// Setup & loop
+// ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("== Aquarium Controller ==");
 
-  // --- Relay pin init ---
-  // Belt-and-suspenders: drive all relay pins LOW via the GPIO matrix BEFORE
-  // configuring them as outputs. This matters especially for HEATER_RELAY_PIN
-  // (GPIO 12) which is a bootstrap strap pin - must read LOW at reset or the
-  // ESP32 won't boot. Writing first, then setting pinMode, avoids any
-  // transient HIGH glitch.
+  // Belt-and-suspenders relay init.
+  // GPIO 12 (HEATER) is a strap pin — must read LOW at boot.
+  // Write before pinMode to avoid any transient HIGH glitch.
   digitalWrite(HEATER_RELAY_PIN, LOW);
   digitalWrite(LIGHTS_RELAY_PIN, LOW);
   digitalWrite(FILTER_RELAY_PIN, LOW);
-
   pinMode(HEATER_RELAY_PIN, OUTPUT);
   pinMode(LIGHTS_RELAY_PIN, OUTPUT);
   pinMode(FILTER_RELAY_PIN, OUTPUT);
-
-  // Re-assert safe state after pinMode.
   digitalWrite(HEATER_RELAY_PIN, LOW);
   digitalWrite(LIGHTS_RELAY_PIN, LOW);
-  digitalWrite(FILTER_RELAY_PIN, LOW);  // Normally-closed relay: LOW keeps filter ON
+  digitalWrite(FILTER_RELAY_PIN, LOW);  // NC relay: LOW = filter ON
 
-  // Current-sense pins (input-only on ADC1, no pinMode strictly required but
-  // explicit is better than implicit).
   pinMode(LIGHTS_SENSE_PIN, INPUT);
   pinMode(HEATER_SENSE_PIN, INPUT);
   pinMode(FILTER_SENSE_PIN, INPUT);
-
   pinMode(TEMP_SENSOR_PIN, INPUT);
 
-  // --- Display + touch ---
   tft.begin();
-  tft.setRotation(3);
+  tft.setRotation(1);
 
   if (!touch.begin()) {
-    Serial.println("TSC2007 not found!");
-    while(1) delay(100);
+    Serial.println("TSC2007 not found — halting");
+    while (1) delay(100);
   }
 
-  // --- Temp sensor ---
   tempSensor.begin();
   tempSensor.requestTemperatures();
-  currentTemp = tempSensor.getTempFByIndex(0);
+  float t = tempSensor.getTempFByIndex(0);
+  if (t > 32 && t < 120) currentTemp = t;
 
-  drawThermostatScreen();
+  lastActivity = millis();
+  drawStatusScreen();
 
-  // --- WiFi + OTA (non-blocking) ---
-  // Kicked off last so the display and sensors are already up if the WiFi
-  // connection takes a few seconds. OTA becomes available once connected.
+  // WiFi + OTA last — display and sensors are already up if connection takes time
   WifiOta::begin();
 }
 
 void loop() {
-  WifiOta::loop();       // service OTA + reconnect logic
+  WifiOta::loop();
   readTemperature();
+  readCurrentSensors();
   controlHeater();
-  updateLights();
+  controlFilter();
+  updateLightsOverride();
+  checkMaintConfirm();
+  checkWifiStatus();
+  checkDisplaySleep();
   handleTouch();
-  delay(50);
 }
