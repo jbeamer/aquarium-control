@@ -21,4 +21,9 @@ void loop();
 // True if currently associated with the AP.
 bool isConnected();
 
+// Logs to Serial and any connected telnet client (port 23).
+// Safe to call before WiFi connects — just writes to Serial until then.
+// Connect with:  nc aquarium.local 23
+void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
 }  // namespace WifiOta
