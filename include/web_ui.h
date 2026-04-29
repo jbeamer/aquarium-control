@@ -22,6 +22,10 @@ extern int    lightsOffHour;
 extern int    threshLights;
 extern int    threshHeater;
 extern int    threshFilter;
-extern int    currAvgWindow;   // samples to average for fault detection (2s each)
+extern int      currAvgWindow;       // samples to average for fault detection (2s each)
+extern uint32_t lastWaterChange;     // unix epoch of last logged change, 0 = never
+extern int      waterChangeInterval; // days between changes (default 14)
+
+void logWaterChange(); // record now as last water change and persist to NVS
 
 }  // namespace WebUi

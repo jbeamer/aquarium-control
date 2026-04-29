@@ -23,7 +23,9 @@ int   lightsOffHour = 15;
 int   threshLights  = 130;
 int   threshHeater  = 250;
 int   threshFilter  = 110;
-int   currAvgWindow = 10;
+int      currAvgWindow      = 10;
+uint32_t lastWaterChange    = 0;
+int      waterChangeInterval = 14;
 
 // ---------------------------------------------------------------------------
 // Internals
@@ -51,7 +53,9 @@ void saveSettings() {
   prefs.putInt("threshLights",    threshLights);
   prefs.putInt("threshHeater",    threshHeater);
   prefs.putInt("threshFilter",    threshFilter);
-  prefs.putInt("currAvgWindow",   currAvgWindow);
+  prefs.putInt("currAvgWindow",    currAvgWindow);
+  prefs.putUInt("lastWaterChg",    lastWaterChange);
+  prefs.putInt("waterChgInterval", waterChangeInterval);
   prefs.end();
 }
 
@@ -64,7 +68,9 @@ void loadSettings() {
   threshLights  = prefs.getInt("threshLights",   threshLights);
   threshHeater  = prefs.getInt("threshHeater",   threshHeater);
   threshFilter  = prefs.getInt("threshFilter",   threshFilter);
-  currAvgWindow = prefs.getInt("currAvgWindow",  currAvgWindow);
+  currAvgWindow       = prefs.getInt("currAvgWindow",    currAvgWindow);
+  lastWaterChange     = prefs.getUInt("lastWaterChg",   lastWaterChange);
+  waterChangeInterval = prefs.getInt("waterChgInterval", waterChangeInterval);
   prefs.end();
 }
 
@@ -104,7 +110,44 @@ static const char HTML_FOOT[] PROGMEM = "</body></html>";
 // Settings page
 // ---------------------------------------------------------------------------
 void handleRoot(AsyncWebServerRequest* req) {
-  char buf[3200];
+  // Pre-compute maintenance strings
+  char lastChangeDateStr[48] = "Never";
+  char nextDueStr[80]        = "&mdash;";
+  const char* dueCssColor    = "#888";
+
+  if (lastWaterChange > 0) {
+    time_t lcTs = (time_t)lastWaterChange;
+    struct tm lcTm;
+    localtime_r(&lcTs, &lcTm);
+    strftime(lastChangeDateStr, sizeof(lastChangeDateStr), "%a %b %d, %Y", &lcTm);
+
+    time_t now; time(&now);
+    int daysSince = (int)((now - lcTs) / 86400);
+    int daysLeft  = waterChangeInterval - daysSince;
+
+    time_t dueTs = lcTs + (time_t)waterChangeInterval * 86400;
+    struct tm dueTm;
+    localtime_r(&dueTs, &dueTm);
+    char dueDateStr[32];
+    strftime(dueDateStr, sizeof(dueDateStr), "%b %d, %Y", &dueTm);
+
+    if (daysLeft > 1) {
+      snprintf(nextDueStr, sizeof(nextDueStr), "%s (in %d days)", dueDateStr, daysLeft);
+      dueCssColor = daysLeft <= 3 ? "#fda020" : "#4f4";
+    } else if (daysLeft == 1) {
+      snprintf(nextDueStr, sizeof(nextDueStr), "%s (tomorrow)", dueDateStr);
+      dueCssColor = "#fda020";
+    } else if (daysLeft == 0) {
+      snprintf(nextDueStr, sizeof(nextDueStr), "%s (today)", dueDateStr);
+      dueCssColor = "#fda020";
+    } else {
+      snprintf(nextDueStr, sizeof(nextDueStr), "%s (overdue %d day%s)",
+               dueDateStr, -daysLeft, -daysLeft == 1 ? "" : "s");
+      dueCssColor = "#f44";
+    }
+  }
+
+  static char buf[4096];
   unsigned long upSec = millis() / 1000;
   snprintf(buf, sizeof(buf),
     "%s"
@@ -143,8 +186,21 @@ void handleRoot(AsyncWebServerRequest* req) {
     "<div class='row'>"
     "<div class='group'><label>Averaging window (samples, 2s each)</label>"
     "<input name='caw' type='number' min='1' max='30' value='%d'></div>"
+    "<div class='group'><label>Water change interval (days)</label>"
+    "<input name='wci' type='number' min='1' max='365' value='%d'></div>"
     "</div>"
     "<button type='submit'>Save</button>"
+    "</form>"
+    "<h2>Maintenance</h2>"
+    "<div style='background:#1a1a1a;border-radius:8px;padding:12px 16px;margin-bottom:16px'>"
+    "<div style='margin-bottom:6px'><span style='color:#aaa'>Last change:</span> "
+    "<b style='color:#ddd'>%s</b></div>"
+    "<div><span style='color:#aaa'>Next due:</span> "
+    "<b style='color:%s'>%s</b></div>"
+    "</div>"
+    "<form method='post' action='/waterchange' style='margin-bottom:16px'>"
+    "<button type='submit' style='background:#2a6;color:#fff;margin-top:0'>"
+    "Log Water Change</button>"
     "</form>"
     "%s",
     HTML_HEAD,
@@ -155,7 +211,8 @@ void handleRoot(AsyncWebServerRequest* req) {
     setPoint, heaterHyst,
     lightsOnHour, lightsOffHour,
     threshLights, threshHeater, threshFilter,
-    currAvgWindow,
+    currAvgWindow, waterChangeInterval,
+    lastChangeDateStr, dueCssColor, nextDueStr,
     HTML_FOOT);
   req->send(200, "text/html", buf);
 }
@@ -168,11 +225,12 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
   if (req->hasParam("tl",   true)) threshLights  = req->getParam("tl",   true)->value().toInt();
   if (req->hasParam("th",   true)) threshHeater  = req->getParam("th",   true)->value().toInt();
   if (req->hasParam("tf",   true)) threshFilter  = req->getParam("tf",   true)->value().toInt();
-  if (req->hasParam("caw",  true)) currAvgWindow = constrain(req->getParam("caw", true)->value().toInt(), 1, 30);
+  if (req->hasParam("caw",  true)) currAvgWindow       = constrain(req->getParam("caw", true)->value().toInt(), 1, 30);
+  if (req->hasParam("wci",  true)) waterChangeInterval = constrain(req->getParam("wci", true)->value().toInt(), 1, 365);
   saveSettings();
-  WifiOta::logf("[Web] Settings saved: sp=%.1f hy=%.1f lon=%d loff=%d tl=%d th=%d tf=%d caw=%d\n",
+  WifiOta::logf("[Web] Settings saved: sp=%.1f hy=%.1f lon=%d loff=%d tl=%d th=%d tf=%d caw=%d wci=%d\n",
                 setPoint, heaterHyst, lightsOnHour, lightsOffHour,
-                threshLights, threshHeater, threshFilter, currAvgWindow);
+                threshLights, threshHeater, threshFilter, currAvgWindow, waterChangeInterval);
   req->redirect("/");
 }
 
@@ -287,6 +345,14 @@ void handleData(AsyncWebServerRequest* req) {
   req->send(200, "application/json", out);
 }
 
+void handleWaterChangePost(AsyncWebServerRequest* req) {
+  time_t now; time(&now);
+  lastWaterChange = (uint32_t)now;
+  saveSettings();
+  WifiOta::logf("[Maint] Water change logged\n");
+  req->redirect("/");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -295,11 +361,12 @@ void handleData(AsyncWebServerRequest* req) {
 void begin() {
   loadSettings();
 
-  server.on("/",         HTTP_GET,  handleRoot);
-  server.on("/settings", HTTP_POST, handleSettingsPost);
-  server.on("/logs",     HTTP_GET,  handleLogsPage);
-  server.on("/chart",    HTTP_GET,  handleChartPage);
-  server.on("/data",     HTTP_GET,  handleData);
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/settings",   HTTP_POST, handleSettingsPost);
+  server.on("/waterchange",HTTP_POST, handleWaterChangePost);
+  server.on("/logs",       HTTP_GET,  handleLogsPage);
+  server.on("/chart",      HTTP_GET,  handleChartPage);
+  server.on("/data",       HTTP_GET,  handleData);
 
   events.onConnect([](AsyncEventSourceClient* client) {
     // Replay ring buffer to new client
@@ -324,6 +391,13 @@ void loop() {
 void setTempStatus(float tempF, bool valid) {
   statusTempF  = tempF;
   statusTempOk = valid;
+}
+
+void logWaterChange() {
+  time_t now; time(&now);
+  lastWaterChange = (uint32_t)now;
+  saveSettings();
+  WifiOta::logf("[Maint] Water change logged\n");
 }
 
 void pushLog(const char* msg) {

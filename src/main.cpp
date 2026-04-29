@@ -140,7 +140,7 @@ unsigned long lightsOverrideStart = 0;
 unsigned long lastCountdownDraw = 0;
 
 // Water-change / maintenance mode
-enum MaintState : uint8_t { MAINT_NORMAL, MAINT_CONFIRM, MAINT_ACTIVE };
+enum MaintState : uint8_t { MAINT_NORMAL, MAINT_CONFIRM, MAINT_ACTIVE, MAINT_DONE_CONFIRM };
 MaintState maintState = MAINT_NORMAL;
 unsigned long maintConfirmAt = 0;
 
@@ -176,14 +176,18 @@ void updateLightsStatus();
 void updateClockDisplay();
 void updateHeaterBadge();
 void drawSparkline();
+void drawWaterChangeReminder();
 
 // ---------------------------------------------------------------------------
 // Schedule helpers
 // ---------------------------------------------------------------------------
-bool isScheduleTime() {
+// Returns true if current time is within the lights schedule window.
+// Returns 'fallback' if the RTC/NTP time is unavailable, so callers can
+// preserve the last known state instead of defaulting to off.
+static bool isScheduleTime(bool fallback) {
   struct tm t;
-  if (!getLocalTime(&t, 0)) return false;
-  if (t.tm_year + 1900 < 2024) return false;   // NTP not yet synced
+  if (!getLocalTime(&t, 0)) return fallback;
+  if (t.tm_year + 1900 < 2024) return fallback;  // NTP not yet synced
   return t.tm_hour >= WebUi::lightsOnHour && t.tm_hour < WebUi::lightsOffHour;
 }
 
@@ -277,12 +281,60 @@ void drawSplash(int pct, const char* status) {
 }
 
 // ---------------------------------------------------------------------------
+// Water-change reminder — drawn in header center zone (x 110-285).
+// Shows nothing when >3 days out or never logged. Amber within 3 days, red when overdue.
+// Normal-mode fill starts at x=160 to avoid overwriting the "AQUARIUM" title (~x=12-155).
+// Maint mode fills from x=110 to extend the amber header seamlessly.
+// ---------------------------------------------------------------------------
+void drawWaterChangeReminder() {
+  bool maint = (maintState == MAINT_ACTIVE);
+  if (maint) {
+    tft.fillRect(110, 0, 175, HEADER_H, C_AMBER);
+    return;
+  }
+  tft.fillRect(160, 0, 125, HEADER_H, C_HEADER);  // x=160-285, clears reminder zone only
+  if (WebUi::lastWaterChange == 0) return;
+
+  time_t now; time(&now);
+  struct tm t;
+  if (!getLocalTime(&t, 0) || t.tm_year + 1900 < 2024) return;
+
+  int daysSince = (int)((now - (time_t)WebUi::lastWaterChange) / 86400);
+  int daysLeft  = WebUi::waterChangeInterval - daysSince;
+  if (daysLeft > 3) return;
+
+  char buf[24];
+  uint16_t col;
+  if (daysLeft > 1) {
+    snprintf(buf, sizeof(buf), "Change in %d days", daysLeft);
+    col = C_AMBER;
+  } else if (daysLeft == 1) {
+    strcpy(buf, "Change tomorrow");
+    col = C_AMBER;
+  } else if (daysLeft == 0) {
+    strcpy(buf, "Change due today");
+    col = C_AMBER;
+  } else {
+    snprintf(buf, sizeof(buf), "Overdue %d day%s", -daysLeft, -daysLeft == 1 ? "" : "s");
+    col = C_RED;
+  }
+
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(col);
+  drawCenteredText(buf, 160, 125, 26);
+}
+
+// ---------------------------------------------------------------------------
 // Draw: header bar — title + WiFi indicator only (no touch target here)
 // ---------------------------------------------------------------------------
 void drawHeader() {
   bool maint = (maintState == MAINT_ACTIVE);
   uint16_t headerBg = maint ? C_AMBER : C_HEADER;
   tft.fillRect(0, 0, SCREEN_W, HEADER_H, headerBg);
+
+  // Paint zone fills before any text so nothing gets overwritten.
+  updateClockDisplay();
+  drawWaterChangeReminder();
 
   tft.setFont(&FreeSansBold12pt7b);
   tft.setTextColor(maint ? C_BG : C_WHITE);
@@ -296,8 +348,6 @@ void drawHeader() {
   tft.setTextColor(WifiOta::isConnected() ? C_GREEN : C_RED);
   tft.setCursor(309, 25);
   tft.print(WifiOta::isConnected() ? "WiFi" : "No WiFi");
-
-  updateClockDisplay();
 }
 
 // ---------------------------------------------------------------------------
@@ -313,12 +363,18 @@ void drawWaterChangeButton() {
     label = "CONFIRM?"; bg = C_AMBER;
   } else if (maintState == MAINT_ACTIVE) {
     label = "RESUME"; bg = C_RED;
+  } else if (maintState == MAINT_DONE_CONFIRM) {
+    label = "LOG CHANGE?"; bg = C_GREEN;
   } else {
     label = "WATER CHANGE"; bg = C_BLUE_DIM;
   }
+  uint16_t textCol;
+  if      (maintState == MAINT_NORMAL)       textCol = C_DIM;
+  else if (maintState == MAINT_DONE_CONFIRM) textCol = C_BG;
+  else                                       textCol = C_WHITE;
   tft.fillRoundRect(WCHG_X, WCHG_Y, WCHG_W, WCHG_H, 10, bg);
   tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(maintState == MAINT_NORMAL ? C_DIM : C_WHITE);
+  tft.setTextColor(textCol);
   int16_t x1, y1; uint16_t tw, th;
   tft.getTextBounds(label, 0, 0, &x1, &y1, &tw, &th);
   tft.setCursor(WCHG_X + (WCHG_W - (int)tw) / 2 - x1,
@@ -831,8 +887,8 @@ void controlLights() {
   static unsigned long lastScheduleCheck = 0;
   unsigned long now = millis();
   if (!scheduleChecked || now - lastScheduleCheck >= 30000UL) {
-    schedOn = isScheduleTime();
-    lastScheduleCheck = now;
+    schedOn = isScheduleTime(schedOn);  // pass current schedOn as fallback so
+    lastScheduleCheck = now;            // an NTP hiccup doesn't turn lights off
     scheduleChecked = true;
   }
 
@@ -871,7 +927,7 @@ void updateLightsOverride() {
 // Water-change confirm timeout
 // ---------------------------------------------------------------------------
 void checkMaintConfirm() {
-  if (maintState != MAINT_CONFIRM) return;
+  if (maintState != MAINT_CONFIRM && maintState != MAINT_DONE_CONFIRM) return;
   if (millis() - maintConfirmAt >= CONFIRM_MS) {
     maintState = MAINT_NORMAL;
     if (!displayAsleep) drawWaterChangeButton();
@@ -911,7 +967,10 @@ void updateClock() {
   if (!getLocalTime(&t, 0)) return;
   if (t.tm_min == lastMin) return;
   lastMin = t.tm_min;
-  if (!displayAsleep) updateClockDisplay();
+  if (!displayAsleep) {
+    updateClockDisplay();
+    drawWaterChangeReminder();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,10 +992,33 @@ static inline bool hit(int tx, int ty, int x, int y, int w, int h) {
   return tx >= x && tx < x + w && ty >= y && ty < y + h;
 }
 
+// Replaces library read_touch(): averages 3 X/Y pairs instead of requiring
+// two consecutive readings within 100 counts. The library's strict consistency
+// check rejects light touches whose contact point shifts slightly between the
+// two rapid measurements. Averaging is more tolerant while keeping accuracy
+// well within the ~10px we need for UI hit-testing.
+static bool readTouch(uint16_t *x, uint16_t *y, uint16_t *z1, uint16_t *z2) {
+  *z1 = touch.command(MEASURE_Z1, ADON_IRQOFF, ADC_12BIT);
+  *z2 = touch.command(MEASURE_Z2, ADON_IRQOFF, ADC_12BIT);
+  if (*z1 == 0) {
+    touch.command(MEASURE_TEMP0, POWERDOWN_IRQON, ADC_12BIT);
+    return false;
+  }
+  long sumX = 0, sumY = 0;
+  for (int i = 0; i < 3; i++) {
+    sumX += touch.command(MEASURE_X, ADON_IRQOFF, ADC_12BIT);
+    sumY += touch.command(MEASURE_Y, ADON_IRQOFF, ADC_12BIT);
+  }
+  touch.command(MEASURE_TEMP0, POWERDOWN_IRQON, ADC_12BIT);
+  *x = (uint16_t)(sumX / 3);
+  *y = (uint16_t)(sumY / 3);
+  return (*x != 4095) && (*y != 4095);
+}
+
 void handleTouch() {
   uint16_t rx, ry, z1, z2;
-  if (!touch.read_touch(&rx, &ry, &z1, &z2)) return;
-  if (z1 < 100) return;
+  if (!readTouch(&rx, &ry, &z1, &z2)) return;
+  if (z1 < 30) return;
 
   // Coordinate mapping for setRotation(1).
   // Serial log lets you verify corner mapping without USB access.
@@ -968,9 +1050,10 @@ void handleTouch() {
 
     } else if (maintState == MAINT_ACTIVE) {
       if (currentTemp >= MAINT_EXIT_MIN_TEMP) {
-        maintState = MAINT_NORMAL;
+        maintState = MAINT_DONE_CONFIRM;
+        maintConfirmAt = millis();
         WifiOta::logf("[Maint] Exiting water-change mode\n");
-        drawStatusScreen();
+        drawStatusScreen();  // header/relays restore; button shows LOG CHANGE?
       } else {
         // Flash warning in the button area, then restore
         tft.fillRoundRect(WCHG_X, WCHG_Y, WCHG_W, WCHG_H, 10, C_RED);
@@ -984,6 +1067,13 @@ void handleTouch() {
         tft.print(wb);
         delay(2500);
         drawWaterChangeButton();
+      }
+    } else if (maintState == MAINT_DONE_CONFIRM) {
+      WebUi::logWaterChange();
+      maintState = MAINT_NORMAL;
+      if (!displayAsleep) {
+        drawWaterChangeButton();
+        drawWaterChangeReminder();
       }
     }
     delay(200);
