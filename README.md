@@ -4,8 +4,7 @@ A full-featured aquarium automation controller built on the Adafruit ESP32 Feath
 
 ---
 
-<!-- TODO: add a photo of the completed display enclosure here -->
-<!-- ![Controller mounted above the tank](docs/images/controller-mounted.jpg) -->
+![Tank overview with controller visible at lower right](docs/images/tank-overview.jpg)
 
 ---
 
@@ -93,14 +92,19 @@ The build uses two 3D-printed enclosures designed in Autodesk Fusion 360:
 
 ## Photos
 
-> 📷 *Photos coming soon.*
+**Display enclosure** — mounted on the side of the tank, showing live temperature, light schedule, and relay states:
 
-<!-- Suggested shots to add:
-  - docs/images/display-enclosure.jpg  — assembled display unit
-  - docs/images/relay-enclosure.jpg    — relay and current sensor wiring
-  - docs/images/web-dashboard.jpg      — web UI screenshot
-  - docs/images/tank-overview.jpg      — full installation on the tank
--->
+![Display enclosure mounted on the tank](docs/images/display-enclosure.jpg)
+
+**Relay enclosure** — houses the relay module and three switched outlets; current sensor jacks exit the right side:
+
+![Relay enclosure mounted near the outlet](docs/images/relay-enclosure.jpg)
+
+**Relay interior** — three-channel relay board with screw terminals and indicator LEDs; AC line wiring uses insulated spade connectors:
+
+![Interior of the relay enclosure](docs/images/relay-interior.jpg)
+
+> 📷 *Web dashboard screenshot coming soon.*
 
 ---
 
