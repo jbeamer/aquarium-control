@@ -26,6 +26,8 @@ extern int      currAvgWindow;       // samples to average for fault detection (
 extern uint32_t lastWaterChange;     // unix epoch of last logged change, 0 = never
 extern int      waterChangeInterval; // days between changes (default 14)
 
-void logWaterChange(); // record now as last water change and persist to NVS
+// Record a water change (when=0 means now) and persist to NVS.
+// Returns false without recording if the clock isn't NTP-synced or the time is in the future.
+bool logWaterChange(time_t when = 0);
 
 }  // namespace WebUi

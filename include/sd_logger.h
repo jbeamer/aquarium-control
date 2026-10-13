@@ -9,7 +9,9 @@
 namespace SdLogger {
 
 void begin(int csPin);
+void loop();  // retries the mount every 30s while unmounted
 bool isReady();
+const char* lastError();  // last mount-failure diagnosis, "" when mounted
 
 // Called every SENSOR_INTERVAL — logs a full sensor sample row.
 void logSample(time_t ts, float tempF,
@@ -19,8 +21,9 @@ void logSample(time_t ts, float tempF,
 // Called on relay state changes — logs a brief event row.
 void logEvent(time_t ts, const char* msg);
 
-// Fills buf with up to maxLen bytes of today's CSV file content.
-// Returns number of bytes written. Used by web /data endpoint.
-size_t readTodayCsv(char* buf, size_t maxLen);
+// Reads up to maxLen bytes from the CSV for the local day containing `day`,
+// starting at `offset`. Returns bytes read; 0 at EOF or if the file is missing.
+// Not NUL-terminated. Used by History to rebuild the chart after boot.
+size_t readDayChunk(time_t day, size_t offset, char* buf, size_t maxLen);
 
 }  // namespace SdLogger

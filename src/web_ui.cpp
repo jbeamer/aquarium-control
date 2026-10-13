@@ -1,6 +1,7 @@
 // web_ui.cpp
 
 #include "web_ui.h"
+#include "history.h"
 #include "sd_logger.h"
 #include "wifi_ota.h"
 
@@ -147,6 +148,13 @@ void handleRoot(AsyncWebServerRequest* req) {
     }
   }
 
+  // Default the backdate field to today; max blocks future dates in the picker
+  char todayStr[11] = "";
+  time_t nowTs; time(&nowTs);
+  struct tm nowTm;
+  localtime_r(&nowTs, &nowTm);
+  if (nowTm.tm_year + 1900 >= 2024) strftime(todayStr, sizeof(todayStr), "%Y-%m-%d", &nowTm);
+
   static char buf[4096];
   unsigned long upSec = millis() / 1000;
   snprintf(buf, sizeof(buf),
@@ -154,6 +162,7 @@ void handleRoot(AsyncWebServerRequest* req) {
     "<div style='background:#1a1a1a;border-radius:8px;padding:12px 16px;"
     "margin-bottom:16px;display:flex;gap:24px;flex-wrap:wrap;align-items:center'>"
     "<span style='color:%s;font-weight:bold'>&#9679; SD %s</span>"
+    "<span style='color:#888;font-size:.85em'>%s</span>"
     "<span style='color:%s;font-weight:bold'>&#9679; WiFi %s</span>"
     "<span style='color:%s;font-weight:bold'>&#9679; Temp %s</span>"
     "<span style='color:#888'>Uptime: %luh %02lum</span>"
@@ -198,13 +207,15 @@ void handleRoot(AsyncWebServerRequest* req) {
     "<div><span style='color:#aaa'>Next due:</span> "
     "<b style='color:%s'>%s</b></div>"
     "</div>"
-    "<form method='post' action='/waterchange' style='margin-bottom:16px'>"
+    "<form method='post' action='/waterchange' style='margin-bottom:16px;"
+    "display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+    "<input name='date' type='date' value='%s' max='%s' style='width:auto'>"
     "<button type='submit' style='background:#2a6;color:#fff;margin-top:0'>"
     "Log Water Change</button>"
     "</form>"
     "%s",
     HTML_HEAD,
-    SdLogger::isReady() ? "#4f4" : "#f44", SdLogger::isReady() ? "Ready" : "Not mounted",
+    SdLogger::isReady() ? "#4f4" : "#f44", SdLogger::isReady() ? "Ready" : "Not mounted", SdLogger::lastError(),
     WifiOta::isConnected() ? "#4f4" : "#f44", WifiOta::isConnected() ? "Connected" : "Disconnected",
     statusTempOk ? "#4f4" : "#f44", statusTempOk ? "OK" : "Fault",
     upSec / 3600, (upSec % 3600) / 60,
@@ -213,6 +224,7 @@ void handleRoot(AsyncWebServerRequest* req) {
     threshLights, threshHeater, threshFilter,
     currAvgWindow, waterChangeInterval,
     lastChangeDateStr, dueCssColor, nextDueStr,
+    todayStr, todayStr,
     HTML_FOOT);
   req->send(200, "text/html", buf);
 }
@@ -260,25 +272,31 @@ void handleLogsPage(AsyncWebServerRequest* req) {
 // Chart page
 // ---------------------------------------------------------------------------
 void handleChartPage(AsyncWebServerRequest* req) {
-  char buf[3000];
+  static char buf[4096];
   snprintf(buf, sizeof(buf),
     "%s"
     "<h2>Temperature &amp; Heater</h2>"
     "<canvas id='c' style='width:100%%;max-width:900px;background:#1a1a1a;"
     "border-radius:8px'></canvas>"
+    "<p id='nodata' style='display:none;color:#888'>No history yet "
+    "(first minute after boot, or SD not mounted).</p>"
     "<script src='https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js'></script>"
     "<script src='https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js'></script>"
     "<script>"
     "fetch('/data').then(r=>r.json()).then(d=>{"
+    "  var temps=d.pts.map(p=>({x:p[0]*1000,y:p[1]})),"
+    "      heater=d.pts.map(p=>({x:p[0]*1000,y:p[2]/100}));"
+    "  if(!temps.length){document.getElementById('c').style.display='none';"
+    "    document.getElementById('nodata').style.display='block';return;}"
     "  var ctx=document.getElementById('c').getContext('2d');"
     "  new Chart(ctx,{"
     "    data:{"
     "      datasets:[{"
-    "        type:'line',label:'Temp (F)',data:d.temps,"
+    "        type:'line',label:'Temp (F)',data:temps,"
     "        borderColor:'#4af',borderWidth:1.5,pointRadius:0,"
     "        yAxisID:'y'"
     "      },{"
-    "        type:'bar',label:'Heater',data:d.heater,"
+    "        type:'bar',label:'Heater duty',data:heater,"
     "        backgroundColor:'rgba(253,160,32,0.25)',borderColor:'rgba(253,160,32,0.5)',"
     "        borderWidth:1,yAxisID:'y2',barPercentage:1,categoryPercentage:1"
     "      }]"
@@ -286,9 +304,10 @@ void handleChartPage(AsyncWebServerRequest* req) {
     "    options:{"
     "      animation:false,responsive:true,"
     "      scales:{"
-    "        x:{type:'time',time:{unit:'minute',displayFormats:{minute:'HH:mm'}},"
+    "        x:{type:'time',time:{unit:'hour',displayFormats:{hour:'HH:mm'}},"
     "           ticks:{color:'#888'},grid:{color:'#222'}},"
-    "        y:{position:'left',ticks:{color:'#adf'},grid:{color:'#222'},"
+    "        y:{position:'left',suggestedMin:%.1f,suggestedMax:%.1f,"
+    "           ticks:{color:'#adf'},grid:{color:'#222'},"
     "           title:{display:true,text:'Temp F',color:'#888'}},"
     "        y2:{position:'right',min:0,max:1,ticks:{display:false},"
     "            grid:{display:false}}"
@@ -299,57 +318,75 @@ void handleChartPage(AsyncWebServerRequest* req) {
     "});"
     "</script>"
     "%s",
-    HTML_HEAD, HTML_FOOT);
+    HTML_HEAD, setPoint - 2.0f, setPoint + 2.0f, HTML_FOOT);
   req->send(200, "text/html", buf);
 }
 
 // ---------------------------------------------------------------------------
-// /data — JSON for chart (reads today's CSV from SD)
+// /data — per-minute history as {"pts":[[unix_s,tempF,heaterPct],...]}
+// Streamed from the RAM ring in chunks; never touches SD from this task.
 // ---------------------------------------------------------------------------
 void handleData(AsyncWebServerRequest* req) {
-  // Read CSV, parse into JSON arrays for Chart.js
-  // {temps:[{x:ms,y:f},...], heater:[{x:ms,y:0or1},...]}
-  static char csvBuf[32768];
-  size_t n = SdLogger::readTodayCsv(csvBuf, sizeof(csvBuf));
+  struct Cursor { uint32_t seq, end; uint8_t phase; bool any; };
+  auto cur = std::make_shared<Cursor>();
+  cur->end = History::total();
+  cur->seq = cur->end > History::SLOTS ? cur->end - History::SLOTS : 0;
+  cur->phase = 0;
+  cur->any = false;
 
-  String out = "{\"temps\":[";
-  String heaterOut = "],\"heater\":[";
-  bool firstT = true, firstH = true;
-
-  char* line = strtok(csvBuf, "\n");
-  while (line) {
-    long long ts;
-    char type[4];
-    float tempF;
-    int heater, lights, filter, pkl, pkh, pkf;
-    int parsed = sscanf(line, "%lld,%3[^,],%f,%d,%d,%d,%d,%d,%d",
-                        &ts, type, &tempF, &heater, &lights, &filter, &pkl, &pkh, &pkf);
-    if (parsed == 9 && type[0] == 'S') {
-      long long ms = ts * 1000LL;
-      if (!firstT) out += ',';
-      char pt[48];
-      snprintf(pt, sizeof(pt), "{\"x\":%lld,\"y\":%.2f}", ms, tempF);
-      out += pt;
-      firstT = false;
-
-      if (!firstH) heaterOut += ',';
-      snprintf(pt, sizeof(pt), "{\"x\":%lld,\"y\":%d}", ms, heater);
-      heaterOut += pt;
-      firstH = false;
-    }
-    line = strtok(nullptr, "\n");
-  }
-
-  out += heaterOut;
-  out += "]}";
-  req->send(200, "application/json", out);
+  AsyncWebServerResponse* res = req->beginChunkedResponse("application/json",
+    [cur](uint8_t* out, size_t maxLen, size_t) -> size_t {
+      constexpr size_t PT_MAX = 32;  // "[4294967295,-327.68,100],"
+      size_t n = 0;
+      if (cur->phase == 0) {
+        if (maxLen < 8) return 0;
+        n += snprintf((char*)out, maxLen, "{\"pts\":[");
+        cur->phase = 1;
+      }
+      if (cur->phase == 1) {
+        while (cur->seq < cur->end && n + PT_MAX < maxLen) {
+          History::Bucket b;
+          if (History::get(cur->seq++, b)) {
+            n += snprintf((char*)out + n, maxLen - n, "%s[%lu,%.2f,%u]",
+                          cur->any ? "," : "", (unsigned long)b.ts,
+                          b.tempF100 / 100.0f, b.heaterPct);
+            cur->any = true;
+          }
+        }
+        if (cur->seq >= cur->end && n + 3 < maxLen) {
+          n += snprintf((char*)out + n, maxLen - n, "]}");
+          cur->phase = 2;
+        }
+        return n;
+      }
+      return 0;  // phase 2: done
+    });
+  req->send(res);
 }
 
+// Optional 'date' field (YYYY-MM-DD) backdates the change; recorded at local
+// noon so the day count isn't skewed by the time of day. Empty/missing = now.
 void handleWaterChangePost(AsyncWebServerRequest* req) {
-  time_t now; time(&now);
-  lastWaterChange = (uint32_t)now;
-  saveSettings();
-  WifiOta::logf("[Maint] Water change logged\n");
+  time_t when = 0;
+  if (req->hasParam("date", true)) {
+    String d = req->getParam("date", true)->value();
+    if (d.length() > 0) {
+      struct tm t = {};
+      if (sscanf(d.c_str(), "%d-%d-%d", &t.tm_year, &t.tm_mon, &t.tm_mday) != 3) {
+        req->send(400, "text/plain", "Bad date");
+        return;
+      }
+      t.tm_year -= 1900;
+      t.tm_mon  -= 1;
+      t.tm_hour  = 12;
+      t.tm_isdst = -1;
+      when = mktime(&t);
+    }
+  }
+  if (!logWaterChange(when)) {
+    req->send(400, "text/plain", "Not logged: clock not synced or date out of range");
+    return;
+  }
   req->redirect("/");
 }
 
@@ -393,11 +430,28 @@ void setTempStatus(float tempF, bool valid) {
   statusTempOk = valid;
 }
 
-void logWaterChange() {
+bool logWaterChange(time_t when) {
   time_t now; time(&now);
-  lastWaterChange = (uint32_t)now;
+  struct tm nowTm;
+  localtime_r(&now, &nowTm);
+  if (nowTm.tm_year + 1900 < 2024) {
+    WifiOta::logf("[Maint] Water change NOT logged: clock not synced\n");
+    return false;
+  }
+  if (when == 0) when = now;
+  // Allow a day of slack for TZ/noon rounding on today's date
+  if (when < 1704067200 /* 2024-01-01 */ || when > now + 86400) {
+    WifiOta::logf("[Maint] Water change NOT logged: date out of range\n");
+    return false;
+  }
+  lastWaterChange = (uint32_t)when;
   saveSettings();
-  WifiOta::logf("[Maint] Water change logged\n");
+  struct tm wt;
+  localtime_r(&when, &wt);
+  char ds[24];
+  strftime(ds, sizeof(ds), "%Y-%m-%d %H:%M", &wt);
+  WifiOta::logf("[Maint] Water change logged: %s\n", ds);
+  return true;
 }
 
 void pushLog(const char* msg) {

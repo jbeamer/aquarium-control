@@ -10,6 +10,7 @@
 #include "wifi_ota.h"
 #include "sd_logger.h"
 #include "web_ui.h"
+#include "history.h"
 
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
@@ -105,6 +106,8 @@
 // ---------------------------------------------------------------------------
 #define TEMP_INTERVAL     2000UL
 #define SENSOR_INTERVAL   2000UL
+#define SENSE_HEARTBEAT_MS     300000UL  // periodic [Sense] log line
+#define SENSE_MISMATCH_LOG_MS   60000UL  // repeat interval while a mismatch persists
 #define SLEEP_MS      (5UL * 60 * 1000)
 #define OVERRIDE_MS   (5UL * 60 * 1000)
 #define CONFIRM_MS    2000UL
@@ -140,7 +143,7 @@ unsigned long lightsOverrideStart = 0;
 unsigned long lastCountdownDraw = 0;
 
 // Water-change / maintenance mode
-enum MaintState : uint8_t { MAINT_NORMAL, MAINT_CONFIRM, MAINT_ACTIVE, MAINT_DONE_CONFIRM };
+enum MaintState : uint8_t { MAINT_NORMAL, MAINT_CONFIRM, MAINT_ACTIVE };
 MaintState maintState = MAINT_NORMAL;
 unsigned long maintConfirmAt = 0;
 
@@ -207,9 +210,14 @@ static void nextScheduleStr(char* buf, int len) {
 // ---------------------------------------------------------------------------
 // Relay helpers — idempotent, log on change
 // ---------------------------------------------------------------------------
+// millis() of last change per channel; sense logging ignores a channel until
+// its averaging window has refilled with post-change samples.
+unsigned long lightsChangedAt = 0, heaterChangedAt = 0, filterChangedAt = 0;
+
 void setHeater(bool on) {
   if (heaterOn == on) return;
   heaterOn = on;
+  heaterChangedAt = millis();
   digitalWrite(HEATER_RELAY_PIN, on ? HIGH : LOW);
   WifiOta::logf("[Heater] %s\n", on ? "ON" : "OFF");
   time_t ts; time(&ts);
@@ -219,6 +227,7 @@ void setHeater(bool on) {
 void setLights(bool on) {
   if (lightsOn == on) return;
   lightsOn = on;
+  lightsChangedAt = millis();
   digitalWrite(LIGHTS_RELAY_PIN, on ? HIGH : LOW);
   WifiOta::logf("[Lights] %s\n", on ? "ON" : "OFF");
   time_t ts; time(&ts);
@@ -228,6 +237,7 @@ void setLights(bool on) {
 void setFilter(bool on) {
   if (filterOn == on) return;
   filterOn = on;
+  filterChangedAt = millis();
   // Normally-closed: LOW = relay off = contacts closed = filter ON
   //                  HIGH = relay on  = contacts open  = filter OFF
   digitalWrite(FILTER_RELAY_PIN, on ? LOW : HIGH);
@@ -363,15 +373,10 @@ void drawWaterChangeButton() {
     label = "CONFIRM?"; bg = C_AMBER;
   } else if (maintState == MAINT_ACTIVE) {
     label = "RESUME"; bg = C_RED;
-  } else if (maintState == MAINT_DONE_CONFIRM) {
-    label = "LOG CHANGE?"; bg = C_GREEN;
   } else {
     label = "WATER CHANGE"; bg = C_BLUE_DIM;
   }
-  uint16_t textCol;
-  if      (maintState == MAINT_NORMAL)       textCol = C_DIM;
-  else if (maintState == MAINT_DONE_CONFIRM) textCol = C_BG;
-  else                                       textCol = C_WHITE;
+  uint16_t textCol = (maintState == MAINT_NORMAL) ? C_DIM : C_WHITE;
   tft.fillRoundRect(WCHG_X, WCHG_Y, WCHG_W, WCHG_H, 10, bg);
   tft.setFont(&FreeSansBold12pt7b);
   tft.setTextColor(textCol);
@@ -816,6 +821,40 @@ void readTemperature() {
   }
 }
 
+// Raw readings go to SD every sample; the live log only gets a periodic
+// heartbeat, plus a line whenever a channel's sensed state (windowed average
+// vs threshold) starts/stops disagreeing with its relay — rate-limited while
+// a mismatch persists, since the filter's on/off ranges overlap.
+void logSenseIfNeeded() {
+  static unsigned long lastHeartbeat = 0, lastMismatchLog = 0;
+  static uint8_t lastMask = 0;
+  static bool first = true;
+
+  unsigned long now = millis();
+  unsigned long settle = (unsigned long)(WebUi::currAvgWindow + 1) * SENSOR_INTERVAL;
+  uint8_t mask = 0;
+  if (now - lightsChangedAt >= settle && (avgPkPkLights > THRESH_LIGHTS) != lightsOn) mask |= 1;
+  if (now - heaterChangedAt >= settle && (avgPkPkHeater > THRESH_HEATER) != heaterOn) mask |= 2;
+  if (now - filterChangedAt >= settle && (avgPkPkFilter > THRESH_FILTER) != filterOn) mask |= 4;
+
+  const char* why = nullptr;
+  if (mask != lastMask)                                        why = mask ? "MISMATCH" : "ok";
+  else if (mask && now - lastMismatchLog >= SENSE_MISMATCH_LOG_MS) why = "MISMATCH";
+  else if (first || now - lastHeartbeat >= SENSE_HEARTBEAT_MS) why = "";
+  if (!why) return;
+
+  first = false;
+  lastHeartbeat = now;
+  if (mask) lastMismatchLog = now;
+  lastMask = mask;
+
+  WifiOta::logf("[Sense] LT:%d/%d(%d)%s HT:%d/%d(%d)%s FT:%d/%d(%d)%s %s\n",
+               pkpkLights, avgPkPkLights, (int)lightsOn, (mask & 1) ? "!" : "",
+               pkpkHeater, avgPkPkHeater, (int)heaterOn, (mask & 2) ? "!" : "",
+               pkpkFilter, avgPkPkFilter, (int)filterOn, (mask & 4) ? "!" : "",
+               why);
+}
+
 void readCurrentSensors() {
   if (millis() - lastSensorRead < SENSOR_INTERVAL) return;
   lastSensorRead = millis();
@@ -844,15 +883,13 @@ void readCurrentSensors() {
   avgPkPkHeater = (int)(sumH / win);
   avgPkPkFilter = (int)(sumF / win);
 
-  WifiOta::logf("[Sense] LT:%d(%d) HT:%d(%d) FT:%d(%d)\n",
-               pkpkLights, (int)lightsOn,
-               pkpkHeater, (int)heaterOn,
-               pkpkFilter, (int)filterOn);
+  logSenseIfNeeded();
 
   time_t now;
   time(&now);
   SdLogger::logSample(now, currentTemp, heaterOn, lightsOn, filterOn,
                       pkpkLights, pkpkHeater, pkpkFilter);
+  if (tempValid) History::add(now, currentTemp, heaterOn);
 
   if (!displayAsleep) updateSensorValues();
 }
@@ -927,7 +964,7 @@ void updateLightsOverride() {
 // Water-change confirm timeout
 // ---------------------------------------------------------------------------
 void checkMaintConfirm() {
-  if (maintState != MAINT_CONFIRM && maintState != MAINT_DONE_CONFIRM) return;
+  if (maintState != MAINT_CONFIRM) return;
   if (millis() - maintConfirmAt >= CONFIRM_MS) {
     maintState = MAINT_NORMAL;
     if (!displayAsleep) drawWaterChangeButton();
@@ -1050,10 +1087,10 @@ void handleTouch() {
 
     } else if (maintState == MAINT_ACTIVE) {
       if (currentTemp >= MAINT_EXIT_MIN_TEMP) {
-        maintState = MAINT_DONE_CONFIRM;
-        maintConfirmAt = millis();
+        maintState = MAINT_NORMAL;
         WifiOta::logf("[Maint] Exiting water-change mode\n");
-        drawStatusScreen();  // header/relays restore; button shows LOG CHANGE?
+        WebUi::logWaterChange();  // resuming = change complete; skipped if clock unset
+        drawStatusScreen();  // header/relays/reminder restore
       } else {
         // Flash warning in the button area, then restore
         tft.fillRoundRect(WCHG_X, WCHG_Y, WCHG_W, WCHG_H, 10, C_RED);
@@ -1067,13 +1104,6 @@ void handleTouch() {
         tft.print(wb);
         delay(2500);
         drawWaterChangeButton();
-      }
-    } else if (maintState == MAINT_DONE_CONFIRM) {
-      WebUi::logWaterChange();
-      maintState = MAINT_NORMAL;
-      if (!displayAsleep) {
-        drawWaterChangeButton();
-        drawWaterChangeReminder();
       }
     }
     delay(200);
@@ -1171,6 +1201,8 @@ void setup() {
 void loop() {
   WifiOta::loop();
   WebUi::loop();
+  SdLogger::loop();
+  History::loop();
   readTemperature();
   readCurrentSensors();
   controlHeater();

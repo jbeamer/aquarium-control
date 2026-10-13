@@ -30,9 +30,9 @@ Development went through several phases: initial proof of concept with basic rel
 - **Current sensing** — non-invasive AC current sensors on all three loads; averaged fault detection flags mismatches between relay state and actual current
 - **3.5" color touchscreen** — dark-themed status display; tap to override lights, initiate water changes, or wake from sleep
 - **Web dashboard** — live status, temperature chart, log stream, and all configurable parameters
-- **Water change tracking** — log changes from the touchscreen or web UI; on-screen reminder as the due date approaches
+- **Water change tracking** — changes are logged automatically when you tap RESUME after a water change, or from the web UI (with an optional backdate); on-screen reminder as the due date approaches
 - **OTA firmware updates** — flash new firmware over WiFi without physical access
-- **SD card logging** — timestamped CSV of temperature, relay states, and current readings
+- **SD card logging** — timestamped CSV of temperature, relay states, and current readings (card must be FAT16/FAT32; exFAT is not supported). Mount is retried every 30 s, with the failure reason shown on the web dashboard
 
 ---
 
@@ -112,7 +112,7 @@ The build uses two 3D-printed enclosures designed in Autodesk Fusion 360:
 
 ### Prerequisites
 
-- [PlatformIO](https://platformio.org/) (VS Code extension or CLI)
+- [PlatformIO](https://platformio.org/) (VS Code extension or CLI). `platformio.ini` pins a toolchain with native Apple Silicon builds, so no Rosetta is needed
 - WiFi credentials in `src/wifi_ota.cpp` (see that file for the `WIFI_SSID` / `WIFI_PASS` defines)
 
 ### First Flash (USB)
@@ -137,8 +137,8 @@ Browse to `http://aquarium.local` after the device boots. From there you can:
 
 - Adjust set point, hysteresis, and schedule hours
 - Set current-sensor fault thresholds and averaging window
-- Configure water change interval and log a change
-- View the live temperature chart and log stream
+- Configure water change interval and log a change (or backdate one)
+- View a rolling 24-hour temperature / heater-duty chart (per-minute averages, rebuilt from SD after a reboot) and the live log stream
 
 All settings persist across reboots in ESP32 NVS flash.
 
@@ -167,11 +167,13 @@ src/
   main.cpp        — display, control loop, touch handling
   web_ui.cpp      — async HTTP server, settings, SSE log stream
   wifi_ota.cpp    — WiFi connection, OTA, logging
-  sd_logger.cpp   — SD card CSV logging
+  sd_logger.cpp   — SD card CSV logging, mount retry and diagnostics
+  history.cpp     — 24h per-minute ring buffer behind the web chart
 include/
   web_ui.h
   wifi_ota.h
   sd_logger.h
+  history.h
 ```
 
 ---
