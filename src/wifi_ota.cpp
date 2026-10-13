@@ -45,8 +45,9 @@ void checkTelnetClients() {
       telnetClient.stop();
     }
     telnetClient = newClient;
-    telnetClient.printf("=== Aquarium Controller  %s ===\r\n",
-                        WiFi.localIP().toString().c_str());
+    telnetClient.printf("=== Aquarium Controller  %s  %s ===\r\n",
+                        WiFi.localIP().toString().c_str(),
+                        WiFi.localIPv6().toString().c_str());
     Serial.println("[Telnet] Client connected");
   }
 
@@ -118,8 +119,18 @@ void startConnect() {
 void begin() {
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
     switch (event) {
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+        // Fires once per address (link-local, then any SLAAC/ULA prefixes the
+        // router advertises), so log the address carried by this event.
+        logf("[WiFi] IPv6 #%d: " IPV6STR "\n", info.got_ip6.ip_index,
+             IPV62STR(info.got_ip6.ip6_info.ip));
+        break;
       case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         reconnectAttempts = 0;
+        // Link-local IPv6 lets mDNS answer AAAA queries. Without it macOS
+        // resolvers stall ~5s waiting for an AAAA reply on aquarium.local.
+        // Must run after the netif is up — at STA_CONNECTED it fails.
+        if (!WiFi.enableIpV6()) logf("[WiFi] IPv6 link-local enable failed\n");
         logf("[WiFi] Connected. IP: %s  RSSI: %d dBm\n",
              WiFi.localIP().toString().c_str(), WiFi.RSSI());
         startTelnet();
