@@ -43,7 +43,16 @@ void commit() {
 void aggregate(time_t ts, float tempF, bool heater) {
   if (tempF < 32.0f || tempF > 120.0f) return;  // sensor fault readings
   uint32_t minute = (uint32_t)(ts / 60);
-  if (minute < accMinute) return;  // out of order (clock step) — drop
+  if (minute < accMinute) {
+    // Clock stepped backwards: latest time wins. Drop the in-progress minute
+    // and any committed buckets that are now in the future, rather than
+    // discarding every sample until the clock catches back up.
+    accN = 0; accSum = 0; accHeat = 0;
+    while (written > 0 && ring[(written - 1) % SLOTS].ts >= minute * 60) {
+      written = written - 1;
+    }
+    accMinute = minute;
+  }
   if (minute != accMinute) {
     commit();
     accMinute = minute;
@@ -81,16 +90,15 @@ void finishBackfill() {
 }  // namespace
 
 void add(time_t ts, float tempF, bool heater) {
-  if (bfState != BF_DONE) return;
+  if (bfState != BF_DONE || !WifiOta::timeSynced()) return;
   aggregate(ts, tempF, heater);
 }
 
 void loop() {
   if (bfState == BF_DONE) return;
 
+  if (!WifiOta::timeSynced()) return;
   time_t now; time(&now);
-  struct tm t;
-  if (!getLocalTime(&t, 0) || t.tm_year + 1900 < 2024) return;  // wait for NTP
 
   if (bfState == BF_WAITING) {
     bfStartMs = millis();

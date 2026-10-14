@@ -21,6 +21,12 @@ void loop();
 // True if currently associated with the AP.
 bool isConnected();
 
+// True once SNTP has set the clock during this boot. After a soft reset
+// (e.g. OTA) the RTC-derived wall clock can be tens of minutes off until
+// then, while still looking plausible — gate anything that stores
+// timestamps on this, not on the year.
+bool timeSynced();
+
 // Logs to Serial and any connected telnet client (port 23).
 // Safe to call before WiFi connects — just writes to Serial until then.
 // Connect with:  nc aquarium.local 23

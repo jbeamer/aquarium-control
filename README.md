@@ -112,7 +112,7 @@ The build uses two 3D-printed enclosures designed in Autodesk Fusion 360:
 
 ### Prerequisites
 
-- [PlatformIO](https://platformio.org/) (VS Code extension or CLI). `platformio.ini` pins a toolchain with native Apple Silicon builds, so no Rosetta is needed
+- [PlatformIO](https://platformio.org/) (VS Code extension or CLI). `platformio.ini` pins espressif32 7.1.3 (Arduino core 2.0.17), whose toolchain runs natively on Apple Silicon, and exact library versions
 - WiFi credentials in `src/wifi_ota.cpp` (see that file for the `WIFI_SSID` / `WIFI_PASS` defines)
 
 ### First Flash (USB)
@@ -139,6 +139,7 @@ Browse to `http://aquarium.local` after the device boots. From there you can:
 - Set current-sensor fault thresholds and averaging window
 - Configure water change interval and log a change (or backdate one)
 - View a rolling 24-hour temperature / heater-duty chart (per-minute averages, rebuilt from SD after a reboot) and the live log stream
+- Download raw daily CSVs at `/sd/YYYYMMDD.csv` (rows logged before NTP sync go to `/sd/notime.csv`)
 
 All settings persist across reboots in ESP32 NVS flash.
 

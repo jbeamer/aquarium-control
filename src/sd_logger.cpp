@@ -26,8 +26,7 @@ void dayFilename(time_t ts, char* buf, size_t len) {
 }
 
 void todayFilename(char* buf, size_t len) {
-  struct tm t;
-  if (getLocalTime(&t, 0) && t.tm_year + 1900 >= 2024) {
+  if (WifiOta::timeSynced()) {
     time_t now; time(&now);
     dayFilename(now, buf, len);
   } else {

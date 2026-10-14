@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <WiFi.h>
+#include <esp_sntp.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <stdarg.h>
@@ -18,6 +19,7 @@ constexpr int RECONNECT_REBOOT_AFTER = 30;  // 30 × 10s = 5 min
 unsigned long lastReconnectAttempt = 0;
 int reconnectAttempts = 0;
 bool otaInitialized = false;
+volatile bool sntpSynced = false;  // set from the lwIP task
 
 // ---------------------------------------------------------------------------
 // Telnet mirror — one client at a time on port 23
@@ -117,6 +119,14 @@ void startConnect() {
 // ---------------------------------------------------------------------------
 
 void begin() {
+  // Runs on every SNTP update; we only care about the first one.
+  sntp_set_time_sync_notification_cb([](struct timeval*) {
+    if (!sntpSynced) {
+      sntpSynced = true;
+      logf("[Time] NTP synced\n");
+    }
+  });
+
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
     switch (event) {
       case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
@@ -167,6 +177,8 @@ void loop() {
     startConnect();
   }
 }
+
+bool timeSynced() { return sntpSynced; }
 
 bool isConnected() {
   return WiFi.status() == WL_CONNECTED;

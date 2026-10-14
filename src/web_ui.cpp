@@ -7,6 +7,7 @@
 
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include <SD.h>
 #include <time.h>
 
 namespace WebUi {
@@ -153,7 +154,7 @@ void handleRoot(AsyncWebServerRequest* req) {
   time_t nowTs; time(&nowTs);
   struct tm nowTm;
   localtime_r(&nowTs, &nowTm);
-  if (nowTm.tm_year + 1900 >= 2024) strftime(todayStr, sizeof(todayStr), "%Y-%m-%d", &nowTm);
+  if (WifiOta::timeSynced()) strftime(todayStr, sizeof(todayStr), "%Y-%m-%d", &nowTm);
 
   static char buf[4096];
   unsigned long upSec = millis() / 1000;
@@ -404,6 +405,8 @@ void begin() {
   server.on("/logs",       HTTP_GET,  handleLogsPage);
   server.on("/chart",      HTTP_GET,  handleChartPage);
   server.on("/data",       HTTP_GET,  handleData);
+  // Raw daily CSVs, e.g. /sd/20261013.csv (streamed in small chunks by the library)
+  server.serveStatic("/sd/", SD, "/");
 
   events.onConnect([](AsyncEventSourceClient* client) {
     // Replay ring buffer to new client
@@ -432,9 +435,7 @@ void setTempStatus(float tempF, bool valid) {
 
 bool logWaterChange(time_t when) {
   time_t now; time(&now);
-  struct tm nowTm;
-  localtime_r(&now, &nowTm);
-  if (nowTm.tm_year + 1900 < 2024) {
+  if (!WifiOta::timeSynced()) {
     WifiOta::logf("[Maint] Water change NOT logged: clock not synced\n");
     return false;
   }
